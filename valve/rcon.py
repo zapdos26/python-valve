@@ -31,9 +31,9 @@ log = logging.getLogger(__name__)
 # See: https://github.com/docopt/docopt/issues/41
 _USAGE = """
 Usage:
-  {program}
-  {program} ADDRESS [-p PASSWORD]
-  {program} ADDRESS -p PASSWORD -e COMMAND
+  {program} [-n]
+  {program} ADDRESS [-p PASSWORD] [-n]
+  {program} ADDRESS -p PASSWORD [-n] -e COMMAND
 
 Arguments:
   ADDRESS       Address of the server to connect to. If the port number
@@ -45,6 +45,8 @@ Options:
                 Password to use when authenticating with the server.
   -e COMMAND --execute=COMMAND
                 Command to execute on the server.
+  -n --no-multi
+                Disables support for Multiple Package Respones
 
 By default this will create a shell for connecting and issuing commands
 to an RCON server. You can either specify the host and password as
@@ -206,11 +208,12 @@ class _ResponseBuffer(object):
     the complete response, not the constituent parts.
     """
 
-    def __init__(self):
+    def __init__(self, multi_part=True):
         self._buffer = b""
         self._responses = []
         self._partial_responses = []
         self._discard_count = 0
+        self._multi_part = multi_part
 
     def pop(self):
         """Pop first received message from the buffer.
@@ -268,18 +271,21 @@ class _ResponseBuffer(object):
             else:
                 if message.type is message.Type.RESPONSE_VALUE:
                     log.debug("Recevied message part %r", message)
-                    self._partial_responses.append(message)
-                    if len(self._partial_responses) >= 2:
-                        penultimate, last = self._partial_responses[-2:]
-                        if (not penultimate.body
-                                and last.body == b"\x00\x01\x00\x00"):
-                            self._enqueue_or_discard(RCONMessage(
-                                self._partial_responses[0].id,
-                                RCONMessage.Type.RESPONSE_VALUE,
-                                b"".join(part.body for part
-                                         in self._partial_responses[:-2]),
-                            ))
-                            del self._partial_responses[:]
+                    if self._multi_part:
+                        self._partial_responses.append(message)
+                        if len(self._partial_responses) >= 2:
+                            penultimate, last = self._partial_responses[-2:]
+                            if (not penultimate.body
+                                    and last.body == b"\x00\x01\x00\x00"):
+                                self._enqueue_or_discard(RCONMessage(
+                                    self._partial_responses[0].id,
+                                    RCONMessage.Type.RESPONSE_VALUE,
+                                    b"".join(part.body for part
+                                             in self._partial_responses[:-2]),
+                                ))
+                                del self._partial_responses[:]
+                    else:
+                        self._enqueue_or_discard(message)
                 else:
                     if self._partial_responses:
                         log.warning("Unexpected message %r", message)
@@ -312,14 +318,15 @@ class RCON(object):
     _REGEX_CVARLIST = re.compile(
         r"-{2,}\n(.+?)-{2,}\n", re.MULTILINE | re.DOTALL)
 
-    def __init__(self, address, password, timeout=None):
+    def __init__(self, address, password, timeout=None, multi_part=True):
         self._address = address
         self._password = password
         self._timeout = timeout if timeout else None
         self._authenticated = False
         self._socket = None
         self._closed = False
-        self._responses = _ResponseBuffer()
+        self._multi_part = multi_part
+        self._responses = _ResponseBuffer(multi_part)
 
     def __enter__(self):
         self.connect()
@@ -569,7 +576,8 @@ class RCON(object):
         if timeout is None:
             timeout = self._timeout
         self._request(RCONMessage.Type.EXECCOMMAND, command)
-        self._request(RCONMessage.Type.RESPONSE_VALUE, "")
+        if self._multi_part:
+            self._request(RCONMessage.Type.RESPONSE_VALUE, "")
         if block:
             try:
                 return self._receive(timeout)
@@ -605,7 +613,7 @@ class RCON(object):
     del _ensure
 
 
-def execute(address, password, command):
+def execute(address, password, command, multi_part=True):
     """Execute a command on an RCON server.
 
     This is a *very* high-level interface which connects to the given
@@ -615,6 +623,10 @@ def execute(address, password, command):
         containing the host as a string and the port as an integer.
     :param str password: the password to use to authenticate the connection.
     :param str command: the command to execute on the server.
+    :param bool multi_part: flag for if RCON server supports
+        `Multiple Packet Responses`_.
+
+    .. _Multiple Packet Responses: https://developer.valvesoftware.com/wiki/Source_RCON_Protocol#Multiple-packet_Responses
 
     :raises UnicodeDecodeError: if the response could not be decoded into
         Unicode.
@@ -627,7 +639,8 @@ def execute(address, password, command):
 
     :returns: the response to the command as a Unicode string.
     """
-    with RCON(address, password) as rcon:
+
+    with RCON(address, password, multi_part=multi_part) as rcon:
         return rcon(command)
 
 
@@ -685,11 +698,12 @@ class _RCONShell(cmd.Cmd):
         !shutdown           Shutdown the server.
         """).strip("\n")
 
-    def __init__(self):
+    def __init__(self, multi_part=True):
         super().__init__()
         self.prompt = self._INITIAL_PROMPT
         self._rcon = None
         self._convars = ()
+        self._multi_part = multi_part
 
     def _connect(self, address, password):
         """Connect to an RCON server.
@@ -708,7 +722,7 @@ class _RCONShell(cmd.Cmd):
         :param password: same as :class:`RCON`.
         """
         self._disconnect()
-        self._rcon = RCON(address, password)
+        self._rcon = RCON(address, password, multi_part=self._multi_part)
         try:
             self._rcon.connect()
             self._rcon.authenticate()
@@ -860,7 +874,8 @@ class _RCONShell(cmd.Cmd):
         """Shutdown the connected server."""
         self.default("exit")
 
-def shell(address=None, password=None):
+
+def shell(address=None, password=None, multi_part=True):
     """A simple interactive RCON shell.
 
     This will connect to the server identified by the given address using
@@ -875,8 +890,12 @@ def shell(address=None, password=None):
         of the RCON server.
     :param str password: the password for the server. This is ignored if
         ``address`` is not given.
+    :param bool multi_part: flag for if RCON server supports
+        `Multiple Packet Responses`_.
+
+    .. _Multiple Packet Responses: https://developer.valvesoftware.com/wiki/Source_RCON_Protocol#Multiple-packet_Responses
     """
-    rcon_shell = _RCONShell()
+    rcon_shell = _RCONShell(multi_part)
     try:
         if address:
             rcon_shell.onecmd("!connect {0[0]}:{0[1]} {1}".format(
@@ -942,10 +961,12 @@ def _main(argv=None):
         address = _parse_address(arguments["ADDRESS"])
     password = arguments["--password"]
     command = arguments["--execute"]
+    multi_part = not arguments["--no-multi"]
+
     if command is None:
-        shell(address, password)
+        shell(address, password, multi_part)
     else:
-        print(execute(address, password, command))
+        print(execute(address, password, command, multi_part))
 
 
 if __name__ == "__main__":

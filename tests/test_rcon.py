@@ -154,6 +154,23 @@ class TestResponseBuffer(object):
         assert message.body == b"barbar"  # Black sheep ...
         assert isinstance(message.body, six.binary_type)
 
+    def test_single_part_response(self):
+        part = (
+            b"\x0D\x00\x00\x00"  # Size
+            b"\x05\x00\x00\x00"  # ID
+            b"\x00\x00\x00\x00"  # Type
+            b"bar"               # Body
+            b"\x00\x00"          # Terminators
+        )
+        buffer_ = valve.rcon._ResponseBuffer(False)
+        buffer_.feed(part)
+        buffer_.feed(part)
+        message = buffer_.pop()
+        assert message.id == 5
+        assert message.type is message.Type.RESPONSE_VALUE
+        assert message.body == b"bar"  # Black sheep ...
+        assert isinstance(message.body, six.binary_type)
+
     def test_discard_before(self):
         auth_response = (
             b"\x0A\x00\x00\x00"  # Size
@@ -342,10 +359,42 @@ class TestRCON(object):
     def test_call(self, request, rcon_server):
         e_request = rcon_server.expect(
             0, valve.rcon.RCONMessage.Type.EXECCOMMAND, b"echo hello")
+        e_request = rcon_server.expect(
+            0, valve.rcon.RCONMessage.Type.RESPONSE_VALUE, b"")
         e_request.respond(
             0, valve.rcon.RCONMessage.Type.RESPONSE_VALUE, b"hello")
         e_request.respond_terminate_multi_part(0)
         rcon = valve.rcon.RCON(rcon_server.server_address, b"")
+        rcon.connect()
+        rcon._authenticated = True
+        request.addfinalizer(rcon.close)
+        response = rcon("echo hello")
+        assert response == "hello"
+        assert isinstance(response, six.text_type)
+
+    def test_call_no_multi_timeout(self, request, rcon_server):
+        e_request = rcon_server.expect(
+            0, valve.rcon.RCONMessage.Type.EXECCOMMAND, b"echo hello")
+        e_request = rcon_server.expect(
+            0, valve.rcon.RCONMessage.Type.RESPONSE_VALUE, b"")
+        e_request.respond(
+            0, valve.rcon.RCONMessage.Type.RESPONSE_VALUE, b"hello")
+        rcon = valve.rcon.RCON(
+            rcon_server.server_address, b"", timeout=3)
+        rcon.connect()
+        rcon._authenticated = True
+        request.addfinalizer(rcon.close)
+        with pytest.raises(valve.rcon.RCONTimeoutError):
+            rcon("echo hello")
+
+    @pytest.mark.timeout(timeout=3, method="thread")
+    def test_call_no_multi(self, request, rcon_server):
+        e_request = rcon_server.expect(
+            0, valve.rcon.RCONMessage.Type.EXECCOMMAND, b"echo hello")
+        e_request.respond(
+            0, valve.rcon.RCONMessage.Type.RESPONSE_VALUE, b"hello")
+        rcon = valve.rcon.RCON(
+            rcon_server.server_address, b"", multi_part=False)
         rcon.connect()
         rcon._authenticated = True
         request.addfinalizer(rcon.close)
@@ -447,11 +496,27 @@ class TestExecute(object):
             0, valve.rcon.RCONMessage.Type.AUTH_RESPONSE, b"")
         e2_request = rcon_server.expect(
             0, valve.rcon.RCONMessage.Type.EXECCOMMAND, b"echo hello")
+        e2_request = rcon_server.expect(
+            0, valve.rcon.RCONMessage.Type.RESPONSE_VALUE, b"")
         e2_request.respond(
             0, valve.rcon.RCONMessage.Type.RESPONSE_VALUE, b"hello")
         e2_request.respond_terminate_multi_part(0)
         response = valve.rcon.execute(
             rcon_server.server_address, "password", "echo hello")
+        assert response == "hello"
+        assert isinstance(response, six.text_type)
+
+    def test_no_multi(self, rcon_server):
+        e1_request = rcon_server.expect(
+            0, valve.rcon.RCONMessage.Type.AUTH, b"password")
+        e1_request.respond(
+            0, valve.rcon.RCONMessage.Type.AUTH_RESPONSE, b"")
+        e2_request = rcon_server.expect(
+            0, valve.rcon.RCONMessage.Type.EXECCOMMAND, b"echo hello")
+        e2_request.respond(
+            0, valve.rcon.RCONMessage.Type.RESPONSE_VALUE, b"hello")
+        response = valve.rcon.execute(
+            rcon_server.server_address, "password", "echo hello", False)
         assert response == "hello"
         assert isinstance(response, six.text_type)
 
@@ -540,19 +605,25 @@ class TestMain(object):
         valve.rcon._main([])
         assert shell.called
         assert not execute.called
-        assert shell.call_args[0] == (None, None)
+        assert shell.call_args[0] == (None, None, True)
 
     def test_address_only(self, shell, execute):
         valve.rcon._main(["localhost:9001"])
         assert shell.called
         assert not execute.called
-        assert shell.call_args[0] == (("localhost", 9001), None)
+        assert shell.call_args[0] == (("localhost", 9001), None, True)
 
     def test_address_and_password(self, shell, execute):
         valve.rcon._main(["localhost:9001", "-p", "password"])
         assert shell.called
         assert not execute.called
-        assert shell.call_args[0] == (("localhost", 9001), "password")
+        assert shell.call_args[0] == (("localhost", 9001), "password", True)
+
+    def test_address_and_password_and_no_multi(self, shell, execute):
+        valve.rcon._main(["localhost:9001", "-p", "password", "-n"])
+        assert shell.called
+        assert not execute.called
+        assert shell.call_args[0] == (("localhost", 9001), "password", False)
 
     def test_password_only(self, shell, execute):
         with pytest.raises(docopt.DocoptExit):
@@ -560,17 +631,41 @@ class TestMain(object):
         assert not shell.called
         assert not execute.called
 
+    def test_no_multi_only(self, shell, execute):
+        valve.rcon._main(["-n"])
+        assert shell.called
+        assert not execute.called
+        assert shell.call_args[0] == (None, None, False)
+
     def test_execute(self, capsys, shell, execute):
         execute.return_value = "command output"
         valve.rcon._main(["localhost:9001", "-p", "password", "-e", "foo"])
         assert not shell.called
         assert execute.called
-        assert execute.call_args[0] == (("localhost", 9001), "password", "foo")
+        assert execute.call_args[0] == (
+            ("localhost", 9001), "password", "foo", True
+        )
+        assert capsys.readouterr()[0] == "command output\n"
+
+    def test_execute_no_multi(self, capsys, shell, execute):
+        execute.return_value = "command output"
+        valve.rcon._main(["localhost:9001", "-p", "password", "-n", "-e", "foo"])
+        assert not shell.called
+        assert execute.called
+        assert execute.call_args[0] == (
+            ("localhost", 9001), "password", "foo", False
+        )
         assert capsys.readouterr()[0] == "command output\n"
 
     def test_execute_no_address(self, shell, execute):
         with pytest.raises(docopt.DocoptExit):
             valve.rcon._main(["-p", "password", "-e", "foo"])
+        assert not shell.called
+        assert not execute.called
+
+    def test_execute_no_address_no_multi(self, shell, execute):
+        with pytest.raises(docopt.DocoptExit):
+            valve.rcon._main(["-p", "password", "-n", "-e", "foo"])
         assert not shell.called
         assert not execute.called
 
@@ -580,8 +675,20 @@ class TestMain(object):
         assert not shell.called
         assert not execute.called
 
+    def test_execute_no_password_no_multi(self, shell, execute):
+        with pytest.raises(docopt.DocoptExit):
+            valve.rcon._main(["localhost:9001", "-n", "-e", "foo"])
+        assert not shell.called
+        assert not execute.called
+
     def test_execute_no_address_or_password(self, shell, execute):
         with pytest.raises(docopt.DocoptExit):
             valve.rcon._main(["-e", "foo"])
+        assert not shell.called
+        assert not execute.called
+
+    def test_execute_no_address_or_password_no_multi(self, shell, execute):
+        with pytest.raises(docopt.DocoptExit):
+            valve.rcon._main(["-n", "-e", "foo"])
         assert not shell.called
         assert not execute.called
